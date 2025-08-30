@@ -1,0 +1,6 @@
+tokens:
+  - PAD
+  - UNK
+  - EnemySpoted
+  - EnemyDamaged
+  - Kill

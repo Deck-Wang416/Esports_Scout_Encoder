@@ -1,0 +1,67 @@
+{
+  "match_id": "M0001",
+  "map": "de_mirage",
+  "rounds": [
+    {
+      "round_number": 1,
+      "players": [
+        {
+          "player_id": "76561198000000000",
+          "name": "PlayerA",
+          "team": "CT",
+          "trajectory": [
+            {
+              "timestamp": 0.4,
+              "action": "peek",
+              "location": "mid_window",
+              "result": {
+                "outcome": ["EnemySpoted"],
+                "impact": ["MapInformation"],
+                "weapon": ["usp_s"],
+                "damage": [0]
+              }
+            },
+            {
+              "timestamp": 1.2,
+              "action": "fire",
+              "location": "mid_window",
+              "result": {
+                "outcome": ["EnemyDamaged"],
+                "impact": ["Pressure"],
+                "weapon": ["usp_s"],
+                "damage": [34]
+              }
+            },
+            {
+              "timestamp": 2.8,
+              "action": "throw_grenade",
+              "location": "mid",
+              "result": {
+                "outcome": ["EnemyDamaged"],
+                "impact": ["ZoneControl"],
+                "weapon": ["he_grenade"],
+                "damage": [52]
+              }
+            },
+            {
+              "timestamp": 4.1,
+              "action": "trade_kill",
+              "location": "connector",
+              "result": {
+                "outcome": ["Kill"],
+                "impact": ["Initiation"],
+                "weapon": ["m4a1_s"],
+                "damage": [100]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "source": "mock",
+    "schema_version": "v0.1",
+    "created_at": "2025-08-20T12:00:00Z"
+  }
+}

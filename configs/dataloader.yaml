@@ -1,0 +1,10 @@
+dataset:
+  split_ratio: 0.8
+  seed: 42
+  T: 16
+
+loader:
+  batch_size: 32
+  num_workers: 4
+  shuffle_train: true
+  shuffle_val: false

@@ -1,0 +1,24 @@
+{
+  "match_id": "M0001",
+  "rounds": [
+    {
+      "round_number": 1,
+      "players": [
+        {
+          "player_id": "P001",
+          "team": "CT",
+          "trajectory": [
+            {
+              "timestamp": 0.5,
+              "action": "peek",
+              "location": "mid_window",
+              "result": {
+                "outcome": ["EnemySpoted"]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

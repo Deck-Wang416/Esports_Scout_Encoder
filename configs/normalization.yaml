@@ -1,0 +1,9 @@
+timestamp:
+  mode: minmax
+  min: 0.0
+  max: 10.0
+
+damage_sum:
+  mode: clip_minmax
+  min: 0.0
+  max: 150.0

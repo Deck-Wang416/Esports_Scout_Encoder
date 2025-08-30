@@ -1,0 +1,7 @@
+tokens:
+  - PAD
+  - UNK
+  - peek
+  - fire
+  - throw_grenade
+  - trade_kill

@@ -1,0 +1,38 @@
+model:
+  type: transformer
+  hidden_dim: 256
+  output_dim: 128
+  num_layers: 2
+  dropout: 0.2
+  nhead: 8
+  ffn_dim: 1024
+  pos_encoding: sincos
+
+inputs:
+  use_action: true
+  use_location: true
+  use_weapon: true
+  use_team: true
+  use_outcome: true
+  use_impact: true
+  use_timestamp: true
+  use_damage_sum: true
+  use_damage_mean: false
+  use_damage_max: false
+  use_is_lethal: true
+  fusion: concat_linear
+
+pooling:
+  type: mean
+
+tag_encoder:
+  type: embedding
+  project_to_output: true
+
+paths:
+  tag_vocab: configs/tags/tag_vocab.yaml
+
+runtime:
+  use_mask: true
+  pad_idx: 0
+  unk_idx: 1

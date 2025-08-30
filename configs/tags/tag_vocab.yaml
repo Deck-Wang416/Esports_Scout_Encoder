@@ -1,0 +1,16 @@
+version: "v0.1"
+roles:
+  - PAD
+  - UNK
+  - ENTRY
+  - SECOND_ENTRY
+  - UTIL
+  - AWPER
+  - LURKER
+traits:
+  - PAD
+  - UNK
+  - utility_awareness
+  - aggression
+  - teamwork
+  - accuracy

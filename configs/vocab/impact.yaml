@@ -1,0 +1,7 @@
+tokens:
+  - PAD
+  - UNK
+  - MapInformation
+  - Pressure
+  - ZoneControl
+  - Initiation

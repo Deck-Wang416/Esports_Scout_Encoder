@@ -1,0 +1,8 @@
+tokens:
+  - PAD
+  - UNK
+  - mid_window
+  - mid
+  - connector
+  - a_site
+  - b_site

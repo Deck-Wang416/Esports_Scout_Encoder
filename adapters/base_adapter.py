@@ -1,31 +1,49 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Mapping, Optional
+from abc import ABC, abstractmethod
 
-@dataclass
+
+@dataclass(frozen=True)
 class Sample:
-    action_idx: list
-    loc_idx: list
-    team_idx: int
-    timestamp_rel: list
-    outcome_multi: list      # [T, |V_outcome|]
-    impact_multi: list       # [T, |V_impact|]
-    weapon_top1_idx: list
-    damage_sum: list
-    damage_mean: list
-    damage_max: list
-    is_lethal: list
-    mask: list               # [T] bool/int
-    meta: Dict[str, Any]
+    """Minimal normalized sample for one player window (length T)."""
+    action_idx: List[int]                 # [T]
+    loc_idx: List[int]                    # [T]
+    team_idx: int                         # scalar (broadcast to [T] later if needed)
+    timestamp_rel: List[float]            # [T]
+    outcome_multi: List[List[int]]        # [T, |V_outcome|] multi-hot (0/1)
+    impact_multi: List[List[int]]         # [T, |V_impact|] multi-hot (0/1)
+    weapon_top1_idx: List[int]            # [T]
+    damage_sum: List[float]               # [T]
+    damage_mean: List[float]              # [T]
+    damage_max: List[float]               # [T]
+    is_lethal: List[int]                  # [T] 0/1
+    mask: List[int]                       # [T] 1=valid, 0=pad
+    meta: Dict[str, Any]                  # logging only (not used by the model)
 
-class BaseAdapter:
-    def __init__(self, vocab_cfg: Dict, norm_cfg: Dict, T: int, K_multi: int = 3):
-        self.vocab = vocab_cfg
-        self.norm  = norm_cfg
-        self.T     = T
-        self.K     = K_multi
 
+class BaseAdapter(ABC):
+    """Parse raw JSON → normalized Samples with hard constraints enforced."""
+
+    def __init__(
+        self,
+        vocab_cfg: Mapping[str, Any],
+        norm_cfg: Optional[Mapping[str, Any]],
+        T: int,
+        k_multi: int = 3,
+    ) -> None:
+        self.vocab = vocab_cfg            # expects vocab.*.tokens etc.
+        self.norm = norm_cfg              # may be None if not provided
+        self.T = T                        # fixed window length
+        self.k_multi = k_multi            # cap for multi-label per event
+
+    @abstractmethod
     def parse_file(self, json_path: str) -> List[Sample]:
+        """Read a JSON file and return a list of Samples."""
         raise NotImplementedError
 
-    def parse_obj(self, obj: dict) -> List[Sample]:
+    @abstractmethod
+    def parse_obj(self, obj: Dict[str, Any]) -> List[Sample]:
+        """Parse an in-memory JSON object and return a list of Samples."""
         raise NotImplementedError

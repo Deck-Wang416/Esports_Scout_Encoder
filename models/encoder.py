@@ -1,4 +1,5 @@
-import torch, torch.nn as nn
+import torch
+import torch.nn as nn
 from .positional import SinCosPosEnc
 
 class Encoder(nn.Module):
@@ -18,16 +19,21 @@ class Encoder(nn.Module):
         self.timestamp_proj = nn.Linear(1, H)
         self.damage_proj    = nn.Linear(4, H)
 
-        # 2) 融合：concat → Linear 回到 H；正则
-        self.fuse = nn.Linear(3*H, H)
+        # 2) Fusion: concat -> Linear to H; then Dropout+LayerNorm
+        self.fuse    = nn.Linear(3 * H, H)   # x (H) + mhot (H) + num (H) -> 3H
         self.fuse_ln = nn.LayerNorm(H)
         self.fuse_do = nn.Dropout(cfg.model.dropout)
 
-        # 3) 位置编码
+        # 3) Positional Encoding
         self.pos_enc = SinCosPosEnc(H)
 
-        # 4) Transformer
-        layer = nn.TransformerEncoderLayer(d_model=H, nhead=cfg.model.nhead, dropout=cfg.model.dropout, batch_first=True)
+        # 4) Transformer (batch_first=True)
+        layer = nn.TransformerEncoderLayer(
+            d_model=H,
+            nhead=cfg.model.nhead,
+            dropout=cfg.model.dropout,
+            batch_first=True
+        )
         self.encoder = nn.TransformerEncoder(layer, num_layers=cfg.model.num_layers)
 
         # 5) Heads
@@ -37,17 +43,27 @@ class Encoder(nn.Module):
 
     def encode_behavior(self, batch):
         B, T = batch["action_idx"].shape
+
         x = (
             self.action_emb(batch["action_idx"])
-          + self.loc_emb(batch["loc_idx"])
-          + self.weapon_emb(batch["weapon_top1_idx"])
-          + self.team_emb(batch["team_idx"].unsqueeze(1))
+            + self.loc_emb(batch["loc_idx"])
+            + self.weapon_emb(batch["weapon_top1_idx"])
+            + self.team_emb(batch["team_idx"].unsqueeze(1))  # [B,1] -> broadcast to [B,T]
         )
-        mhot = self.outcome_proj(batch["outcome_multi"]) + self.impact_proj(batch["impact_multi"])
-        num  = self.timestamp_proj(batch["timestamp_rel"].unsqueeze(-1)) \
-             + self.damage_proj(torch.stack([batch["damage_sum"], batch["damage_mean"], batch["damage_max"], batch["is_lethal"]], dim=-1))
-        # 简单 concat：x, mhot, num 各 H → [B,T,3H]
-        x_cat = torch.cat([x, mhot, num], dim=-1)
+
+        mhot = (
+            self.outcome_proj(batch["outcome_multi"])
+            + self.impact_proj(batch["impact_multi"])
+        )
+        num = (
+            self.timestamp_proj(batch["timestamp_rel"].unsqueeze(-1))
+            + self.damage_proj(torch.stack(
+                [batch["damage_sum"], batch["damage_mean"], batch["damage_max"], batch["is_lethal"]],
+                dim=-1
+            ))
+        )
+
+        x_cat = torch.cat([x, mhot, num], dim=-1)     # [B,T,3H]
         x = self.fuse_do(self.fuse_ln(self.fuse(x_cat)))
         x = self.pos_enc(x)
         x = self.encoder(x, src_key_padding_mask=~batch["mask"].bool())
@@ -55,13 +71,13 @@ class Encoder(nn.Module):
         return self.behavior_head(z)
 
     def encode_tag(self, tag_ids):
-        # 接受 List[int] 或 LongTensor
+        # Accept List[int] or LongTensor
         if isinstance(tag_ids, list):
             tag_ids = torch.tensor(tag_ids, dtype=torch.long, device=self.tag_emb.weight.device)
         else:
             tag_ids = tag_ids.to(dtype=torch.long, device=self.tag_emb.weight.device)
 
-        # 兜底：越界 / 负数 → UNK
+        # Out-of-range -> UNK
         unk = getattr(self, "tag_meta", {}).get("unk_idx", 1)
         vocab_size = self.tag_emb.num_embeddings
         bad = (tag_ids < 0) | (tag_ids >= vocab_size)
@@ -76,4 +92,4 @@ class Encoder(nn.Module):
     def _masked_mean(x, mask):
         m = mask.unsqueeze(-1).float()
         denom = m.sum(dim=1).clamp_min(1.0)
-        return (x*m).sum(dim=1) / denom
+        return (x * m).sum(dim=1) / denom

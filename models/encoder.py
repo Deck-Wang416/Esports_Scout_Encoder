@@ -61,11 +61,11 @@ class Encoder(nn.Module):
 
         # Discrete ids -> Embedding(H)
         if use.use_action:
-            self.action_emb = nn.Embedding(vocab_sizes["action"], H)
+            self.action_emb = nn.Embedding(vocab_sizes["action"], H, padding_idx=getattr(cfg.runtime, "pad_idx", 0))
         if use.use_location:
-            self.loc_emb    = nn.Embedding(vocab_sizes["location"], H)
+            self.loc_emb    = nn.Embedding(vocab_sizes["location"], H, padding_idx=getattr(cfg.runtime, "pad_idx", 0))
         if use.use_weapon:
-            self.weapon_emb = nn.Embedding(vocab_sizes["weapon"], H)
+            self.weapon_emb = nn.Embedding(vocab_sizes["weapon"], H, padding_idx=getattr(cfg.runtime, "pad_idx", 0))
         if use.use_team:
             self.team_emb   = nn.Embedding(2, H)  # 0=CT,1=T
 
@@ -194,6 +194,7 @@ class Encoder(nn.Module):
 
         # pos + transformer
         x = self.pos_enc(x)
+        x = x.masked_fill((~mask).unsqueeze(-1), 0.0)
         x = self.encoder(x, src_key_padding_mask=~mask)
 
         z = self.pool(x, mask)                     # [B,H]

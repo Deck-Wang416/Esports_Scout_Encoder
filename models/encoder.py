@@ -1,6 +1,7 @@
 # models/encoder.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .positional import SinCosPosEnc
 
 def _proj_block(in_dim: int, H: int, p: float):
@@ -10,6 +11,37 @@ def _proj_block(in_dim: int, H: int, p: float):
         nn.LayerNorm(H),
         nn.Dropout(p),
     )
+
+class MeanPool(nn.Module):
+    """Mask-aware mean over time: [B,T,H] -> [B,H]."""
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        m = mask.unsqueeze(-1).float()
+        denom = m.sum(dim=1).clamp_min(1.0)
+        return (x * m).sum(dim=1) / denom
+
+class MaxPool(nn.Module):
+    """Mask-aware max over time: padding positions are -inf."""
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        neg_inf = torch.finfo(x.dtype).min
+        m = mask.unsqueeze(-1)
+        x_masked = x.masked_fill(~m, neg_inf)
+        return x_masked.max(dim=1).values
+
+class AttnPool(nn.Module):
+    """Single-head additive attention pooling with mask: [B,T,H] -> [B,H]."""
+    def __init__(self, H: int, attn_dim: int = 128):
+        super().__init__()
+        self.score = nn.Sequential(
+            nn.Linear(H, attn_dim),
+            nn.Tanh(),
+            nn.Linear(attn_dim, 1),
+        )
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        # x:[B,T,H], mask:[B,T]
+        s = self.score(x).squeeze(-1)  # [B,T]
+        s = s.masked_fill(~mask, float('-inf'))
+        a = F.softmax(s, dim=1).unsqueeze(-1)  # [B,T,1]
+        return (a * x).sum(dim=1)
 
 class Encoder(nn.Module):
     """
@@ -85,7 +117,19 @@ class Encoder(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=cfg.model.num_layers)
 
-        # == 5) Heads ==
+        # == 5) Pooling ==
+        pool_type = getattr(cfg.pooling, 'type', 'mean').lower()
+        if pool_type == 'mean':
+            self.pool = MeanPool()
+        elif pool_type == 'max':
+            self.pool = MaxPool()
+        elif pool_type == 'attn':
+            attn_dim = getattr(cfg.pooling, 'attn_dim', 128)
+            self.pool = AttnPool(H, attn_dim)
+        else:
+            raise ValueError(f"Unknown pooling.type: {pool_type}")
+
+        # == 6) Heads ==
         self.behavior_head = nn.Linear(H, D)
 
         # Tag encoder: ids -> H -> D
@@ -152,8 +196,7 @@ class Encoder(nn.Module):
         x = self.pos_enc(x)
         x = self.encoder(x, src_key_padding_mask=~mask)
 
-        # mask-aware mean pooling
-        z = self._masked_mean(x, mask)             # [B,H]
+        z = self.pool(x, mask)                     # [B,H]
         return self.behavior_head(z)               # [B,D]
 
     # ---------- Tag ----------
@@ -174,9 +217,3 @@ class Encoder(nn.Module):
 
         h = self.tag_emb(tag_ids)   # [N,H]
         return self.tag_head(h)     # [N,D]
-
-    @staticmethod
-    def _masked_mean(x, mask):
-        m = mask.unsqueeze(-1).float()
-        denom = m.sum(dim=1).clamp_min(1.0)
-        return (x * m).sum(dim=1) / denom

@@ -20,7 +20,7 @@ inputs:
   use_damage_mean: false
   use_damage_max: false
   use_is_lethal: true
-  fusion: concat_linear
+  fusion: concat_linear 
 
 pooling:
   type: mean
@@ -31,6 +31,8 @@ tag_encoder:
 
 paths:
   tag_vocab: configs/tags/tag_vocab.yaml
+  vocab_dir: configs/vocab
+  normalization: configs/normalization.yaml
 
 runtime:
   use_mask: true

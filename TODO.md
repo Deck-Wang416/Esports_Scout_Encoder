@@ -30,7 +30,7 @@
 ---
 
 ## 4. Pooling & Behavior Head
-- [ ] Implement `masked_mean` pooling → `[B, H]`
+- [ ] Implement pooling with multiple strategies (e.g., masked_mean, masked_max) → `[B, H]`
 - [ ] Add `behavior_head (H→D)` to produce `z_behavior`
 
 **Check:** `encode_behavior -> (B, D)` matches `output_dim` in config
@@ -50,6 +50,8 @@
 - [ ] Handle out-of-range / negative tag ids (map to UNK=1)
 - [ ] Ensure correct dtypes (long/float/bool)
 - [ ] Prevent divide-by-zero in pooling (`clamp_min(1.0)`)
+- [ ] Construct effective mask (`m_eff`) to identify valid positions
+- [ ] Handle all-padding cases by returning zero-safe outputs
 
 **Check:** No crash on edge cases (empty tags, all padding, single sample)
 

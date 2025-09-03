@@ -31,3 +31,13 @@ Expected: it will
 	• Run the encoder forward pass (encode_behavior and encode_tag),
 	• Print dimension / numeric / consistency checks,
 	• End with Sanity checks finished without assertion errors.
+
+## 3. Run unit tests
+
+You can run the full unit test suite using pytest:
+
+```bash
+pytest -q
+```
+
+All tests should pass without errors, covering encoder shapes, determinism, mask consistency, and padding safety.

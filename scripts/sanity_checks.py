@@ -147,22 +147,44 @@ def main():
     cos = cosine(z_b, z_b_diff).mean().item()
     print(f"[Check] cosine(z_b, z_b_diff) = {cos:.4f}  (should not be ~1.0)")
 
-    # ========== Mask behavior ==========
-    # Build a no-padding variant by zeroing padded positions and forcing mask=1
-    mask = batch["mask"].bool()
-    batch_no_pad = {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items()}
-    for k, v in batch_no_pad.items():
-        if torch.is_tensor(v) and v.ndim >= 2 and v.shape[:2] == mask.shape:
-            if v.dtype == torch.long:
-                v[~mask] = 0
-            else:
-                v[~mask] = 0.0
-    batch_no_pad["mask"] = torch.ones_like(batch["mask"], dtype=torch.bool)
-
+    # ========== Mask behavior (strict per-sample trimming) ==========
+    # For each sample, trim sequence to its valid length (sum of mask),
+    # set mask=1 for the trimmed window, encode, and then compare with the
+    # masked forward on the original batch. Results should be close.
     with torch.no_grad():
-        z_mask = model.encode_behavior(batch)        # with mask
-        z_full = model.encode_behavior(batch_no_pad) # as-if no pad
-    diff = (z_mask - z_full).abs().max().item()
+        z_mask = model.encode_behavior(batch)  # masked forward on full batch
+
+        mask = batch["mask"].bool()  # [B, T]
+        valid_len = mask.sum(dim=1).tolist()
+
+        def _slice_sample(bdict, i, L):
+            sub = {}
+            for k, v in bdict.items():
+                if torch.is_tensor(v):
+                    # Slice tensors with [B, T, ...] leading dims
+                    if v.dim() >= 2 and v.shape[0] == mask.shape[0] and v.shape[1] == mask.shape[1]:
+                        sub[k] = v[i:i+1, :L]
+                    # Slice tensors with [B, ...] leading dims
+                    elif v.dim() >= 1 and v.shape[0] == mask.shape[0]:
+                        sub[k] = v[i:i+1]
+                    else:
+                        sub[k] = v  # leave untouched (e.g., embeddings not in batch)
+                else:
+                    sub[k] = v  # lists/dicts (e.g., meta)
+            # Force mask to all-ones after trimming
+            sub["mask"] = torch.ones(1, L, dtype=torch.bool, device=mask.device)
+            return sub
+
+        zs = []
+        for i, L in enumerate(valid_len):
+            L = int(L)
+            # If a sample is entirely padding, keep a single pad token to avoid empty tensor
+            L_eff = max(L, 1)
+            sub = _slice_sample(batch, i, L_eff)
+            zs.append(model.encode_behavior(sub))
+        z_trim = torch.cat(zs, dim=0)
+
+    diff = (z_mask - z_trim).abs().max().item()
     print(f"[Check] mask consistency max|Δ|={diff:.6g}")
 
     print("\nSanity checks finished without assertion errors.")

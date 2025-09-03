@@ -1,4 +1,3 @@
-# models/encoder.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -50,6 +49,45 @@ class Encoder(nn.Module):
     - Sequence modeling via TransformerEncoder.
     - Mask-aware mean pooling -> [B, H] -> head -> [B, D].
     """
+    def _stack_damage(self, batch):
+        """Stack enabled damage fields -> [B,T,num_feats] or None if none enabled."""
+        if not (hasattr(self, "damage_proj") and self.num_damage_feats > 0):
+            return None
+        names = ["damage_sum", "damage_mean", "damage_max", "is_lethal"]
+        dmg_tensors = [batch[n] for n, on in zip(names, self.damage_use) if on]
+        if len(dmg_tensors) == 0:
+            return None
+        return torch.stack(dmg_tensors, dim=-1)  # [B,T,num_feats]
+
+    def _build_feature_dict(self, batch):
+        """Compute per-channel features once. Returns dict of {name: [B,T,H]}.
+        Keys may include: action, location, weapon, team, outcome, impact, timestamp, damage.
+        """
+        B, T = batch["action_idx"].shape
+        feats = {}
+        # Discrete
+        if hasattr(self, "action_emb"):
+            feats["action"] = self.action_emb(batch["action_idx"])            # [B,T,H]
+        if hasattr(self, "loc_emb"):
+            feats["location"] = self.loc_emb(batch["loc_idx"])                # [B,T,H]
+        if hasattr(self, "weapon_emb"):
+            feats["weapon"] = self.weapon_emb(batch["weapon_top1_idx"])       # [B,T,H]
+        if hasattr(self, "team_emb"):
+            team = batch["team_idx"].unsqueeze(1).expand(-1, T)                 # [B,T]
+            feats["team"] = self.team_emb(team)                                 # [B,T,H]
+        # Multi-hot
+        if hasattr(self, "outcome_proj"):
+            feats["outcome"] = self.outcome_proj(batch["outcome_multi"])      # [B,T,H]
+        if hasattr(self, "impact_proj"):
+            feats["impact"] = self.impact_proj(batch["impact_multi"])         # [B,T,H]
+        # Numeric
+        if hasattr(self, "timestamp_proj"):
+            feats["timestamp"] = self.timestamp_proj(batch["timestamp_rel"].unsqueeze(-1))  # [B,T,H]
+        dmg = self._stack_damage(batch)
+        if dmg is not None:
+            feats["damage"] = self.damage_proj(dmg)                             # [B,T,H]
+        return feats
+
     def __init__(self, cfg, vocab_sizes, tag_vocab_size):
         super().__init__()
         self.cfg = cfg
@@ -155,89 +193,51 @@ class Encoder(nn.Module):
         B, T = batch["action_idx"].shape
         mask = batch["mask"].bool()  # [B,T]
 
-        feats = []
+        feats_dict = self._build_feature_dict(batch)
 
-        # Discrete channels -> [B,T,H]
-        if hasattr(self, "action_emb"):
-            feats.append(self.action_emb(batch["action_idx"]))
-        if hasattr(self, "loc_emb"):
-            feats.append(self.loc_emb(batch["loc_idx"]))
-        if hasattr(self, "weapon_emb"):
-            feats.append(self.weapon_emb(batch["weapon_top1_idx"]))
-        if hasattr(self, "team_emb"):
-            team = batch["team_idx"].unsqueeze(1).expand(-1, T)  # [B,T]
-            feats.append(self.team_emb(team))
+        # === Compute effective mask from raw batch tensors (exclude team which is broadcast-only) ===
+        B, T = mask.shape
+        device = next(self.parameters()).device
+        pad_idx = getattr(self.cfg.runtime, "pad_idx", 0)
 
-        # Multi-hot -> H
-        if hasattr(self, "outcome_proj"):
-            feats.append(self.outcome_proj(batch["outcome_multi"]))
-        if hasattr(self, "impact_proj"):
-            feats.append(self.impact_proj(batch["impact_multi"]))
+        data_present = torch.zeros((B, T), dtype=torch.bool, device=device)
 
-        # Numeric -> H
-        if hasattr(self, "timestamp_proj"):
-            feats.append(self.timestamp_proj(batch["timestamp_rel"].unsqueeze(-1)))  # [B,T,1] -> H
+        # discrete ids
+        if "action_idx" in batch:
+            data_present |= (batch["action_idx"].to(device) != pad_idx)
+        if "loc_idx" in batch:
+            data_present |= (batch["loc_idx"].to(device) != pad_idx)
+        if "weapon_top1_idx" in batch:
+            data_present |= (batch["weapon_top1_idx"].to(device) != pad_idx)
+        # team_idx is broadcast-only feature -> excluded
 
-        if hasattr(self, "damage_proj") and self.num_damage_feats > 0:
-            dmg_tensors = []
-            # 顺序固定（与 damage_use 对齐）
-            names = ["damage_sum", "damage_mean", "damage_max", "is_lethal"]
-            for name, on in zip(names, self.damage_use):
-                if on:
-                    dmg_tensors.append(batch[name])
-            dmg = torch.stack(dmg_tensors, dim=-1)  # [B,T,num_damage_feats]
-            feats.append(self.damage_proj(dmg))     # -> [B,T,H]
+        # multi-hot
+        if "outcome_multi" in batch:
+            data_present |= (batch["outcome_multi"].to(device).abs().sum(dim=-1) > 0)
+        if "impact_multi" in batch:
+            data_present |= (batch["impact_multi"].to(device).abs().sum(dim=-1) > 0)
 
-        # Concatenate all features (including team) for fusion
-        x_cat = torch.cat(feats, dim=-1)  # [B,T,F]
+        # numeric
+        if "timestamp_rel" in batch:
+            data_present |= (batch["timestamp_rel"].to(device).abs() > 0)
+        for dn in ("damage_sum", "damage_mean", "damage_max", "is_lethal"):
+            if dn in batch:
+                data_present |= (batch[dn].to(device).abs() > 0)
 
-        # Compute presence from raw inputs (avoid projection biases)
-        eps = 1e-6
-        present = torch.zeros((B, T), dtype=torch.bool, device=x_cat.device)
-        # Discrete content channels
-        if hasattr(self, "action_emb"):
-            present |= (batch["action_idx"] > 0)
-        if hasattr(self, "loc_emb"):
-            present |= (batch["loc_idx"] > 0)
-        if hasattr(self, "weapon_emb"):
-            present |= (batch["weapon_top1_idx"] > 0)
-        # Multi-hot content channels
-        if hasattr(self, "outcome_proj"):
-            present |= (batch["outcome_multi"].abs().sum(dim=-1) > 0)
-        if hasattr(self, "impact_proj"):
-            present |= (batch["impact_multi"].abs().sum(dim=-1) > 0)
-        # Numeric content channels
-        if hasattr(self, "timestamp_proj"):
-            present |= (batch["timestamp_rel"].abs() > eps)
-        if hasattr(self, "damage_proj") and self.num_damage_feats > 0:
-            dmg_present = torch.zeros((B, T), dtype=torch.bool, device=x_cat.device)
-            names = ["damage_sum", "damage_mean", "damage_max", "is_lethal"]
-            for name, on in zip(names, self.damage_use):
-                if on:
-                    v = batch[name]
-                    if v.dtype.is_floating_point:
-                        dmg_present |= (v.abs() > eps)
-                    else:
-                        dmg_present |= (v != 0)
-            present |= dmg_present
+        m_eff = mask.to(device) & data_present
 
-        # Effective mask: only positions marked valid by upstream mask AND with any real content
-        m_eff = mask & present
+        # Concatenate all enabled features for fusion (including team if present)
+        x_cat = torch.cat(list(feats_dict.values()), dim=-1)  # [B,T,F]
 
         x = self.fuse_do(self.fuse_ln(self.fuse(x_cat)))  # [B,T,H]
-
-        # If all positions are padding, skip Transformer to avoid NestedTensor crash.
         if not m_eff.any():
-            z = x.new_zeros((B, x.size(-1)))       # [B,H]
+            z = x.new_zeros((B, x.size(-1)))
             return self.behavior_head(z)
-
         x = self.pos_enc(x)
-        # Zero-out invalid (padded) positions explicitly to prevent leakage.
         x = x.masked_fill((~m_eff).unsqueeze(-1), 0.0)
         x = self.encoder(x, src_key_padding_mask=~m_eff)
-
-        z = self.pool(x, m_eff)                    # [B,H]
-        return self.behavior_head(z)               # [B,D]
+        z = self.pool(x, m_eff)
+        return self.behavior_head(z)
 
     # ---------- Tag ----------
     def encode_tag(self, tag_ids):

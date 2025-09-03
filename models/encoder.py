@@ -1,92 +1,179 @@
+# models/encoder.py
 import torch
 import torch.nn as nn
 from .positional import SinCosPosEnc
 
+def _proj_block(in_dim: int, H: int, p: float):
+    """Linear -> LayerNorm -> Dropout"""
+    return nn.Sequential(
+        nn.Linear(in_dim, H),
+        nn.LayerNorm(H),
+        nn.Dropout(p),
+    )
+
 class Encoder(nn.Module):
+    """
+    Behavior encoder (sequence -> z_behavior) + Tag encoder (ids -> z_tag).
+    - Each enabled input channel is projected to H, then concatenated and fused back to H.
+    - Sequence modeling via TransformerEncoder.
+    - Mask-aware mean pooling -> [B, H] -> head -> [B, D].
+    """
     def __init__(self, cfg, vocab_sizes, tag_vocab_size):
         super().__init__()
+        self.cfg = cfg
         H, D = cfg.model.hidden_dim, cfg.model.output_dim
+        p = cfg.model.dropout
 
-        # 1) Embedding / Projection → H
-        self.action_emb = nn.Embedding(vocab_sizes["action"], H)
-        self.loc_emb    = nn.Embedding(vocab_sizes["location"], H)
-        self.weapon_emb = nn.Embedding(vocab_sizes["weapon"], H)
-        self.team_emb   = nn.Embedding(2, H)
+        # == 1) Per-channel encoders (project to H) ==
+        use = cfg.inputs
 
-        self.outcome_proj = nn.Linear(vocab_sizes["outcome"], H)
-        self.impact_proj  = nn.Linear(vocab_sizes["impact"],  H)
+        # Discrete ids -> Embedding(H)
+        if use.use_action:
+            self.action_emb = nn.Embedding(vocab_sizes["action"], H)
+        if use.use_location:
+            self.loc_emb    = nn.Embedding(vocab_sizes["location"], H)
+        if use.use_weapon:
+            self.weapon_emb = nn.Embedding(vocab_sizes["weapon"], H)
+        if use.use_team:
+            self.team_emb   = nn.Embedding(2, H)  # 0=CT,1=T
 
-        self.timestamp_proj = nn.Linear(1, H)
-        self.damage_proj    = nn.Linear(4, H)
+        # Multi-hot -> Linear(H)
+        if use.use_outcome:
+            self.outcome_proj = _proj_block(vocab_sizes["outcome"], H, p)
+        if use.use_impact:
+            self.impact_proj  = _proj_block(vocab_sizes["impact"],  H, p)
 
-        # 2) Fusion: concat -> Linear to H; then Dropout+LayerNorm
-        self.fuse    = nn.Linear(3 * H, H)   # x (H) + mhot (H) + num (H) -> 3H
+        # Numeric -> Linear(H)
+        if use.use_timestamp:
+            self.timestamp_proj = _proj_block(1, H, p)
+
+        # damage_* 统一打包成 4 维（sum/mean/max/is_lethal），按开关自动拼装
+        self.damage_use = [use.use_damage_sum, use.use_damage_mean, use.use_damage_max, use.use_is_lethal]
+        self.num_damage_feats = sum(int(x) for x in self.damage_use)
+        if self.num_damage_feats > 0:
+            self.damage_proj = _proj_block(self.num_damage_feats, H, p)
+
+        # 统计开启通道数，确定 F
+        self.enabled_channels = []
+        for name, flag in [
+            ("action",   use.use_action),
+            ("location", use.use_location),
+            ("weapon",   use.use_weapon),
+            ("team",     use.use_team),
+            ("outcome",  use.use_outcome),
+            ("impact",   use.use_impact),
+            ("timestamp",use.use_timestamp),
+            ("damage",   self.num_damage_feats > 0),
+        ]:
+            if flag:
+                self.enabled_channels.append(name)
+        assert len(self.enabled_channels) > 0, "No input channels enabled."
+
+        F = len(self.enabled_channels) * H
+
+        # == 2) Fusion: concat -> Linear(F->H) -> LN -> Dropout ==
+        self.fuse = nn.Linear(F, H)
         self.fuse_ln = nn.LayerNorm(H)
-        self.fuse_do = nn.Dropout(cfg.model.dropout)
+        self.fuse_do = nn.Dropout(p)
 
-        # 3) Positional Encoding
+        # == 3) Positional encoding ==
         self.pos_enc = SinCosPosEnc(H)
 
-        # 4) Transformer (batch_first=True)
+        # == 4) Transformer (batch_first=True) ==
         layer = nn.TransformerEncoderLayer(
-            d_model=H,
-            nhead=cfg.model.nhead,
-            dropout=cfg.model.dropout,
-            batch_first=True
+            d_model=H, nhead=cfg.model.nhead, dropout=p, batch_first=True
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=cfg.model.num_layers)
 
-        # 5) Heads
+        # == 5) Heads ==
         self.behavior_head = nn.Linear(H, D)
+
+        # Tag encoder: ids -> H -> D
         self.tag_emb  = nn.Embedding(tag_vocab_size, H)
         self.tag_head = nn.Linear(H, D)
+        # meta（可选，用于 encode_tag 兜底越界）
+        self.tag_meta = {"unk_idx": getattr(cfg.runtime, "unk_idx", 1)}
 
+    # ---------- Behavior ----------
     def encode_behavior(self, batch):
+        """
+        batch keys:
+          action_idx [B,T] long
+          loc_idx    [B,T] long
+          team_idx   [B]   long (broadcast to [B,T])
+          timestamp_rel [B,T] float
+          outcome_multi [B,T,Vo]
+          impact_multi  [B,T,Vi]
+          weapon_top1_idx [B,T] long
+          damage_* [B,T] float
+          mask [B,T] bool
+        """
         B, T = batch["action_idx"].shape
+        mask = batch["mask"].bool()  # [B,T]
 
-        x = (
-            self.action_emb(batch["action_idx"])
-            + self.loc_emb(batch["loc_idx"])
-            + self.weapon_emb(batch["weapon_top1_idx"])
-            + self.team_emb(batch["team_idx"].unsqueeze(1))  # [B,1] -> broadcast to [B,T]
-        )
+        feats = []
 
-        mhot = (
-            self.outcome_proj(batch["outcome_multi"])
-            + self.impact_proj(batch["impact_multi"])
-        )
-        num = (
-            self.timestamp_proj(batch["timestamp_rel"].unsqueeze(-1))
-            + self.damage_proj(torch.stack(
-                [batch["damage_sum"], batch["damage_mean"], batch["damage_max"], batch["is_lethal"]],
-                dim=-1
-            ))
-        )
+        # Discrete channels -> [B,T,H]
+        if hasattr(self, "action_emb"):
+            feats.append(self.action_emb(batch["action_idx"]))
+        if hasattr(self, "loc_emb"):
+            feats.append(self.loc_emb(batch["loc_idx"]))
+        if hasattr(self, "weapon_emb"):
+            feats.append(self.weapon_emb(batch["weapon_top1_idx"]))
+        if hasattr(self, "team_emb"):
+            team = batch["team_idx"].unsqueeze(1).expand(-1, T)  # [B,T]
+            feats.append(self.team_emb(team))
 
-        x_cat = torch.cat([x, mhot, num], dim=-1)     # [B,T,3H]
-        x = self.fuse_do(self.fuse_ln(self.fuse(x_cat)))
+        # Multi-hot -> H
+        if hasattr(self, "outcome_proj"):
+            feats.append(self.outcome_proj(batch["outcome_multi"]))
+        if hasattr(self, "impact_proj"):
+            feats.append(self.impact_proj(batch["impact_multi"]))
+
+        # Numeric -> H
+        if hasattr(self, "timestamp_proj"):
+            feats.append(self.timestamp_proj(batch["timestamp_rel"].unsqueeze(-1)))  # [B,T,1] -> H
+
+        if hasattr(self, "damage_proj") and self.num_damage_feats > 0:
+            dmg_tensors = []
+            # 顺序固定（与 damage_use 对齐）
+            names = ["damage_sum", "damage_mean", "damage_max", "is_lethal"]
+            for name, on in zip(names, self.damage_use):
+                if on:
+                    dmg_tensors.append(batch[name])
+            dmg = torch.stack(dmg_tensors, dim=-1)  # [B,T,num_damage_feats]
+            feats.append(self.damage_proj(dmg))     # -> [B,T,H]
+
+        # concat -> fuse back to H
+        x_cat = torch.cat(feats, dim=-1)           # [B,T,F]
+        x = self.fuse_do(self.fuse_ln(self.fuse(x_cat)))  # [B,T,H]
+
+        # pos + transformer
         x = self.pos_enc(x)
-        x = self.encoder(x, src_key_padding_mask=~batch["mask"].bool())
-        z = self._masked_mean(x, batch["mask"])
-        return self.behavior_head(z)
+        x = self.encoder(x, src_key_padding_mask=~mask)
 
+        # mask-aware mean pooling
+        z = self._masked_mean(x, mask)             # [B,H]
+        return self.behavior_head(z)               # [B,D]
+
+    # ---------- Tag ----------
     def encode_tag(self, tag_ids):
-        # Accept List[int] or LongTensor
+        # accepts List[int] or LongTensor
         if isinstance(tag_ids, list):
             tag_ids = torch.tensor(tag_ids, dtype=torch.long, device=self.tag_emb.weight.device)
         else:
             tag_ids = tag_ids.to(dtype=torch.long, device=self.tag_emb.weight.device)
 
-        # Out-of-range -> UNK
-        unk = getattr(self, "tag_meta", {}).get("unk_idx", 1)
+        # out-of-range -> UNK
+        unk = self.tag_meta.get("unk_idx", 1)
         vocab_size = self.tag_emb.num_embeddings
         bad = (tag_ids < 0) | (tag_ids >= vocab_size)
         if bad.any():
             tag_ids = tag_ids.clone()
             tag_ids[bad] = unk
 
-        h = self.tag_emb(tag_ids)   # [N, H]
-        return self.tag_head(h)     # [N, D]
+        h = self.tag_emb(tag_ids)   # [N,H]
+        return self.tag_head(h)     # [N,D]
 
     @staticmethod
     def _masked_mean(x, mask):

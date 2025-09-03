@@ -188,16 +188,55 @@ class Encoder(nn.Module):
             dmg = torch.stack(dmg_tensors, dim=-1)  # [B,T,num_damage_feats]
             feats.append(self.damage_proj(dmg))     # -> [B,T,H]
 
-        # concat -> fuse back to H
-        x_cat = torch.cat(feats, dim=-1)           # [B,T,F]
+        # Concatenate all features (including team) for fusion
+        x_cat = torch.cat(feats, dim=-1)  # [B,T,F]
+
+        # Compute presence from raw inputs (avoid projection biases)
+        eps = 1e-6
+        present = torch.zeros((B, T), dtype=torch.bool, device=x_cat.device)
+        # Discrete content channels
+        if hasattr(self, "action_emb"):
+            present |= (batch["action_idx"] > 0)
+        if hasattr(self, "loc_emb"):
+            present |= (batch["loc_idx"] > 0)
+        if hasattr(self, "weapon_emb"):
+            present |= (batch["weapon_top1_idx"] > 0)
+        # Multi-hot content channels
+        if hasattr(self, "outcome_proj"):
+            present |= (batch["outcome_multi"].abs().sum(dim=-1) > 0)
+        if hasattr(self, "impact_proj"):
+            present |= (batch["impact_multi"].abs().sum(dim=-1) > 0)
+        # Numeric content channels
+        if hasattr(self, "timestamp_proj"):
+            present |= (batch["timestamp_rel"].abs() > eps)
+        if hasattr(self, "damage_proj") and self.num_damage_feats > 0:
+            dmg_present = torch.zeros((B, T), dtype=torch.bool, device=x_cat.device)
+            names = ["damage_sum", "damage_mean", "damage_max", "is_lethal"]
+            for name, on in zip(names, self.damage_use):
+                if on:
+                    v = batch[name]
+                    if v.dtype.is_floating_point:
+                        dmg_present |= (v.abs() > eps)
+                    else:
+                        dmg_present |= (v != 0)
+            present |= dmg_present
+
+        # Effective mask: only positions marked valid by upstream mask AND with any real content
+        m_eff = mask & present
+
         x = self.fuse_do(self.fuse_ln(self.fuse(x_cat)))  # [B,T,H]
 
-        # pos + transformer
-        x = self.pos_enc(x)
-        x = x.masked_fill((~mask).unsqueeze(-1), 0.0)
-        x = self.encoder(x, src_key_padding_mask=~mask)
+        # If all positions are padding, skip Transformer to avoid NestedTensor crash.
+        if not m_eff.any():
+            z = x.new_zeros((B, x.size(-1)))       # [B,H]
+            return self.behavior_head(z)
 
-        z = self.pool(x, mask)                     # [B,H]
+        x = self.pos_enc(x)
+        # Zero-out invalid (padded) positions explicitly to prevent leakage.
+        x = x.masked_fill((~m_eff).unsqueeze(-1), 0.0)
+        x = self.encoder(x, src_key_padding_mask=~m_eff)
+
+        z = self.pool(x, m_eff)                    # [B,H]
         return self.behavior_head(z)               # [B,D]
 
     # ---------- Tag ----------

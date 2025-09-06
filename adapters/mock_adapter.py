@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import List, Dict, Any, Sequence
 from .base_adapter import BaseAdapter, Sample
+from collections import Counter, defaultdict
 
 
 # --- helpers --------------------------------------------------------------
@@ -46,6 +47,7 @@ class MockAdapter(BaseAdapter):
 
     def parse_obj(self, obj: Dict[str, Any]) -> List[Sample]:
         T = self.T
+        K = self.k_multi
 
         # vocab lists (PAD, UNK at 0/1)
         act_vocab = getattr(self.vocab.action, "tokens", [])
@@ -63,111 +65,166 @@ class MockAdapter(BaseAdapter):
         ts_max  = getattr(ts_cfg, "max", 1.0)
 
         dmg_sum_cfg = getattr(self.norm, "damage_sum", None) if self.norm is not None else None
-        dmg_lo = getattr(dmg_sum_cfg, "min", 0.0)
-        dmg_hi = getattr(dmg_sum_cfg, "max", 1e9)
+        dmg_mode = getattr(dmg_sum_cfg, "mode", "clip_minmax")
+        dmg_min = getattr(dmg_sum_cfg, "min", 0.0)
+        dmg_max = getattr(dmg_sum_cfg, "max", 1e9)
 
         samples: List[Sample] = []
 
-        for rnd in obj.get("rounds", []):
-            for p in rnd.get("players", []):
-                traj = sorted(p.get("trajectory", []), key=lambda e: e.get("timestamp", 0.0))
+        rounds = obj.get("rounds", [])
+        for rnd in rounds:
+            round_number = rnd.get("round_number", 0)
 
-                # single window: truncate/pad to T
-                evs = traj[:T]
-                L = len(evs)
-                pad = T - L
-                mask = [1] * L + [0] * pad  # int mask for downstream BoolTensor
+            players = rnd.get("players", [])
+            if isinstance(players, dict):
+                players = [players]
 
-                # timestamps
-                ts_vals = [float(e.get("timestamp", 0.0)) for e in evs]
-                if ts_mode == "minmax":
-                    ts = [_norm_minmax(x, ts_min, ts_max) for x in ts_vals]
-                else:
-                    ts = ts_vals
-                ts += [0.0] * pad
+            for p in players:
+                player_id = p.get("player_id", "unknown")
+                team = str(p.get("team", "CT")).upper()
+                team_idx = 0 if team == "CT" else 1
 
-                # discrete ids
-                action_idx = [_tok2id(act_vocab, str(e.get("action", ""))) for e in evs] + [0] * pad
-                loc_idx    = [_tok2id(loc_vocab, str(e.get("location", ""))) for e in evs] + [0] * pad
-                team_idx   = 0 if str(p.get("team", "CT")).upper() == "CT" else 1
+                # 过滤有效事件：timestamp 必须存在且非负
+                traj = [e for e in p.get("trajectory", []) if "timestamp" in e and isinstance(e["timestamp"], (int, float)) and e["timestamp"] >= 0.0]  # 改动：添加 timestamp 验证
 
-                # multi-label → cap K, dedupe, then multi-hot
-                outcome_multi: List[List[int]] = []
-                impact_multi:  List[List[int]] = []
+                # 按 timestamp 排序
+                traj.sort(key=lambda e: e["timestamp"])
 
-                for e in evs:
-                    res = e.get("result", {}) or {}
-                    outs = list(dict.fromkeys(res.get("outcome", []) or []))[: self.k_multi]
-                    imps = list(dict.fromkeys(res.get("impact",  []) or []))[: self.k_multi]
+                # 按 T 大小切分非重叠窗口
+                for win_start in range(0, len(traj), T):
+                    evs = traj[win_start:win_start + T]
+                    if not evs:
+                        continue
 
-                    o_vec = [0] * O
-                    for tok in outs:
-                        idx = _tok2id(out_vocab, str(tok))
-                        if 0 <= idx < O:
-                            o_vec[idx] = 1
+                    L = len(evs)
+                    pad = T - L
+                    mask = [1] * L + [0] * pad  # 用于后续 BoolTensor
 
-                    i_vec = [0] * I
-                    for tok in imps:
-                        idx = _tok2id(imp_vocab, str(tok))
-                        if 0 <= idx < I:
-                            i_vec[idx] = 1
+                    ts_vals = [e["timestamp"] for e in evs]
+                    min_ts = min(ts_vals) if ts_vals else 0.0
+                    ts_rel = [t - min_ts for t in ts_vals]
 
-                    outcome_multi.append(o_vec)
-                    impact_multi.append(i_vec)
+                    # 归一化
+                    if ts_mode == "minmax":
+                        ts_norm = [_norm_minmax(t, ts_min, ts_max) for t in ts_rel]
+                    else:
+                        ts_norm = ts_rel
+                    ts_norm += [0.0] * pad
 
-                outcome_multi += [[0] * O] * pad
-                impact_multi  += [[0] * I] * pad
+                    # 离散字段索引
+                    action_idx = [_tok2id(act_vocab, str(e.get("action", ""))) for e in evs] + [0] * pad
+                    loc_idx = [_tok2id(loc_vocab, str(e.get("location", ""))) for e in evs] + [0] * pad
 
-                # weapon top1 (mock: take first if present)
-                weapon_top1_idx = [
-                    _tok2id(wpn_vocab, (e.get("result", {}).get("weapon", [""]) or [""])[0])
-                    for e in evs
-                ] + [0] * pad
+                    # 多标签处理：去重、限制 K 个
+                    outcome_multi: List[List[int]] = []
+                    impact_multi: List[List[int]] = []
 
-                # ---- damage aggregation (robust extraction) ----
-                def _first_num(x):
-                    # x can be int/float, list, None, etc.
-                    if isinstance(x, (int, float)):
-                        return float(x)
-                    if isinstance(x, list):
-                        return float(x[0]) if x else 0.0
-                    return 0.0
+                    for e in evs:
+                        res = e.get("result", {}) or {}
+                        outs = list(dict.fromkeys(res.get("outcome", []) or []))[:K]
+                        imps = list(dict.fromkeys(res.get("impact", []) or []))[:K]
 
-                dmg_vals = []
-                for e in evs:
-                    res = e.get("result", {}) or {}
-                    dmg_raw = res.get("damage", 0)       # may be int/float/list/empty
-                    v = _first_num(dmg_raw)
-                    # optional clamp by normalization cfg (if provided)
-                    v = _clip(v, dmg_lo, dmg_hi)
-                    dmg_vals.append(v)
+                        o_vec = [0] * O
+                        for tok in outs:
+                            idx = _tok2id(out_vocab, str(tok))
+                            if idx > 1:
+                                o_vec[idx] = 1
 
-                # keep the simple baseline: use the same scalar for sum/mean/max in mock
-                dmg_sum   = dmg_vals + [0]*(T-L)
-                dmg_mean  = dmg_vals + [0]*(T-L)
-                dmg_max   = dmg_vals + [0]*(T-L)
-                is_lethal = [1 if v >= 100.0 else 0 for v in dmg_vals] + [0]*(T-L)
+                        i_vec = [0] * I
+                        for tok in imps:
+                            idx = _tok2id(imp_vocab, str(tok))
+                            if idx > 1:
+                                i_vec[idx] = 1
 
-                meta = {
-                    "match_id": obj.get("match_id"),
-                    "player_id": p.get("player_id"),
-                    "round_number": rnd.get("round_number"),
-                }
+                        outcome_multi.append(o_vec)
+                        impact_multi.append(i_vec)
 
-                samples.append(Sample(
-                    action_idx=action_idx,
-                    loc_idx=loc_idx,
-                    team_idx=team_idx,
-                    timestamp_rel=ts,
-                    outcome_multi=outcome_multi,
-                    impact_multi=impact_multi,
-                    weapon_top1_idx=weapon_top1_idx,
-                    damage_sum=dmg_sum,
-                    damage_mean=dmg_mean,
-                    damage_max=dmg_max,
-                    is_lethal=is_lethal,
-                    mask=mask,
-                    meta=meta,
-                ))
+                    outcome_multi += [[0] * O] * pad
+                    impact_multi += [[0] * I] * pad
+
+                    # 武器与伤害聚合（每事件）
+                    weapon_top1_idx = []
+                    dmg_sums = []
+                    dmg_means = []
+                    dmg_maxs = []
+                    is_lethals = []
+
+                    for e in evs:
+                        res = e.get("result", {}) or {}
+                        weapons = res.get("weapon", [])
+                        if not isinstance(weapons, list):
+                            weapons = [weapons] if weapons else []
+
+                        damages = res.get("damage", [])
+                        if not isinstance(damages, list):
+                            damages = [damages] if damages is not None else []
+
+                        damage_vals = []
+                        for d in damages:
+                            try:
+                                damage_vals.append(float(d))
+                            except (ValueError, TypeError):
+                                pass
+
+                        # 伤害聚合
+                        d_sum = sum(damage_vals)
+                        d_max = max(damage_vals) if damage_vals else 0.0
+                        d_mean = d_sum / len(damage_vals) if damage_vals else 0.0
+                        is_l = 1 if d_max >= 100.0 else 0
+                        # 最大伤害 >= 100 判断 is_lethal
+
+                        if dmg_mode == "clip_minmax":
+                            d_sum = _clip(d_sum, dmg_min, dmg_max)
+                            d_max = _clip(d_max, dmg_min, dmg_max)
+                            d_mean = _clip(d_mean, dmg_min, dmg_max)
+
+                        dmg_sums.append(d_sum)
+                        dmg_means.append(d_mean)
+                        dmg_maxs.append(d_max)
+                        is_lethals.append(is_l)
+
+                        # 武器 top1：如果有伤害配对则按伤害加权，否则按频次
+                        if weapons:
+                            if len(weapons) == len(damage_vals):
+                                w_dmg = defaultdict(float)
+                                for w, d in zip(weapons, damage_vals):
+                                    w_dmg[str(w)] += d
+                                top_w = max(w_dmg, key=w_dmg.get)
+                            else:
+                                cnt = Counter(str(w) for w in weapons)
+                                top_w = cnt.most_common(1)[0][0] if cnt else ""
+                            w_idx = _tok2id(wpn_vocab, top_w)
+                        else:
+                            w_idx = 1  # 无武器时使用 UNK
+                        weapon_top1_idx.append(w_idx)
+
+                    weapon_top1_idx += [0] * pad
+                    dmg_sums += [0.0] * pad
+                    dmg_means += [0.0] * pad
+                    dmg_maxs += [0.0] * pad
+                    is_lethals += [0] * pad
+
+                    meta = {
+                        "match_id": obj.get("match_id"),
+                        "player_id": player_id,
+                        "round_number": round_number,
+                        "window_start_s": min_ts,
+                    }
+
+                    samples.append(Sample(
+                        action_idx=action_idx,
+                        loc_idx=loc_idx,
+                        team_idx=team_idx,
+                        timestamp_rel=ts_norm,
+                        outcome_multi=outcome_multi,
+                        impact_multi=impact_multi,
+                        weapon_top1_idx=weapon_top1_idx,
+                        damage_sum=dmg_sums,
+                        damage_mean=dmg_means,
+                        damage_max=dmg_maxs,
+                        is_lethal=is_lethals,
+                        mask=mask,
+                        meta=meta,
+                    ))
 
         return samples

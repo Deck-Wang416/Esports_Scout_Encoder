@@ -1,6 +1,4 @@
 # Esports_Scout_Encoder
-Minimal runnable encoder project for esports data.  
-This repo currently provides two test scripts to validate the setup.
 
 ## 1. Check vocabulary files
 
@@ -19,7 +17,6 @@ Expected: it will print the size of each vocab, warn if PAD/UNK are missing, and
 Run the minimal pipeline test with encoder + mock data:
 
 ```bash
-export PYTHONPATH=$(pwd)
 python scripts/sanity_checks.py \
   --encoder-cfg configs/encoder.yaml \
   --dataloader-cfg configs/dataloader.yaml \
@@ -34,10 +31,14 @@ Expected: it will
 
 ## 3. Run unit tests
 
-You can run the full unit test suite using pytest:
+Use pytest to run all unit tests (both encoder and adapter).
 
 ```bash
 pytest -q
 ```
 
-All tests should pass without errors, covering encoder shapes, determinism, mask consistency, and padding safety.
+This will run:
+	•	tests/test_encoder_shapes.py: checks encoder input/output shapes, determinism, mask consistency, and padding safety.
+	•	tests/test_adapter_rules.py: checks adapter parsing logic, vocab mapping, window splitting, deduplication, and handling of invalid/missing fields.
+
+Expected: all tests should pass without errors or assertion failures.

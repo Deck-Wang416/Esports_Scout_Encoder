@@ -11,7 +11,7 @@ class Sample:
     action_idx: List[int]                 # [T]
     loc_idx: List[int]                    # [T]
     team_idx: int                         # scalar (broadcast to [T] later if needed)
-    timestamp_rel: List[float]            # [T]
+    timestamp_rel: List[float]            # [T] (optionally normalized)
     outcome_multi: List[List[int]]        # [T, |V_outcome|] multi-hot (0/1)
     impact_multi: List[List[int]]         # [T, |V_impact|] multi-hot (0/1)
     weapon_top1_idx: List[int]            # [T]
@@ -19,12 +19,20 @@ class Sample:
     damage_mean: List[float]              # [T]
     damage_max: List[float]               # [T]
     is_lethal: List[int]                  # [T] 0/1
-    mask: List[int]                       # [T] 1=valid, 0=pad
+    mask: List[int]                       # [T] Boolean mask (1=valid, 0=padding)
     meta: Dict[str, Any]                  # logging only (not used by the model)
 
 
 class BaseAdapter(ABC):
-    """Parse raw JSON → normalized Samples with hard constraints enforced."""
+    """
+    Abstract base class for adapters that parse raw JSON into `Sample` objects.
+
+    - Fixed window length: `T`.
+    - Multi-label cap per event: `k_multi`.
+    - Vocab indexing conventions: PAD=0, UNK=1.
+
+    Implementations must provide `parse_file` and `parse_obj`.
+    """
 
     def __init__(
         self,

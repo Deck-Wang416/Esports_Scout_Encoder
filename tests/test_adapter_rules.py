@@ -1,8 +1,6 @@
 import json
 import unittest
 from unittest.mock import MagicMock
-from collections import Counter, defaultdict
-from typing import Any, Dict, List, Sequence
 
 from adapters.mock_adapter import MockAdapter
 
@@ -19,11 +17,11 @@ class TestMockAdapterRules(unittest.TestCase):
         self.norm.timestamp = MagicMock(mode="minmax", min=0.0, max=10.0)
         self.norm.damage_sum = MagicMock(mode="clip_minmax", min=0.0, max=150.0)
 
-        self.T = 4  # 窗口大小
-        self.k_multi = 3  # 多标签最大数量
+        self.T = 4  # Window length
+        self.k_multi = 3  # Max labels per event (K)
         self.adapter = MockAdapter(self.vocab, self.norm, self.T, self.k_multi)
 
-        # Mock JSON 数据
+        # Mock JSON input
         self.mock_json = '''
         {
             "match_id": "M0001",
@@ -95,30 +93,30 @@ class TestMockAdapterRules(unittest.TestCase):
         '''
 
     def test_valid_input(self):
-        """测试正常输入的解析：验证字段正确性、窗口切分、归一化等"""
+        """Parse valid input: verify fields, windowing, and normalization."""
         data = json.loads(self.mock_json)
         samples = self.adapter.parse_obj(data)
         
-        self.assertEqual(len(samples), 1, "应生成一个样本（单个玩家，单个窗口）")
+        self.assertEqual(len(samples), 1, "Should produce one sample (single player, single window)")
         sample = samples[0]
 
-        # 验证硬约束：timestamp 相对时间且归一化
-        # timestamp: [0.4, 1.2, 2.8, 4.1] -> 相对 [0.0, 0.8, 2.4, 3.7] -> 归一化 / (10.0 - 0.0)
+        # Verify hard constraints: relative timestamps with normalization
+        # timestamp: [0.4, 1.2, 2.8, 4.1] -> relative [0.0, 0.8, 2.4, 3.7] -> normalized by (10.0 - 0.0)
         expected_ts = [0.0, 0.08, 0.24, 0.37]
         for i, (actual, expected) in enumerate(zip(sample.timestamp_rel, expected_ts)):
-            self.assertAlmostEqual(actual, expected, places=5, msg=f"timestamp_rel[{i}] 不匹配")
+            self.assertAlmostEqual(actual, expected, places=5, msg=f"timestamp_rel[{i}] mismatch")
 
-        # 验证 location 使用标准化词表
-        self.assertEqual(sample.loc_idx, [2, 2, 3, 4], "location 索引应为 [mid_window=2, mid_window=2, mid=3, connector=4]")
+        # Verify that location uses the standardized vocabulary
+        self.assertEqual(sample.loc_idx, [2, 2, 3, 4], "location indices should be [mid_window=2, mid_window=2, mid=3, connector=4]")
 
-        # 验证 outcome/impact 多热编码，最大 K=3
+        # Verify outcome/impact multi-hot encoding with K=3 cap
         expected_outcome = [
             [0, 0, 1, 0, 0, 0],  # EnemySpoted=2
             [0, 0, 0, 1, 0, 0],  # EnemyDamaged=3
             [0, 0, 0, 1, 0, 0],  # EnemyDamaged=3
             [0, 0, 0, 0, 1, 0]   # Kill=4
         ]
-        self.assertEqual(sample.outcome_multi, expected_outcome, "outcome_multi 不匹配")
+        self.assertEqual(sample.outcome_multi, expected_outcome, "outcome_multi mismatch")
         
         expected_impact = [
             [0, 0, 1, 0, 0, 0],  # MapInformation=2
@@ -126,26 +124,26 @@ class TestMockAdapterRules(unittest.TestCase):
             [0, 0, 0, 0, 1, 0],  # ZoneControl=4
             [0, 0, 0, 0, 0, 1]   # Initiation=5
         ]
-        self.assertEqual(sample.impact_multi, expected_impact, "impact_multi 不匹配")
+        self.assertEqual(sample.impact_multi, expected_impact, "impact_multi mismatch")
 
-        # 验证 mask
-        self.assertEqual(sample.mask, [1, 1, 1, 1], "mask 应全为 1，无 padding")
+        # Verify mask
+        self.assertEqual(sample.mask, [1, 1, 1, 1], "mask should be all 1s (no padding)")
 
-        # 验证 weapon_top1_idx 和 damage 聚合
-        self.assertEqual(sample.weapon_top1_idx, [2, 2, 3, 4], "weapon_top1_idx 应为 [usp_s=2, usp_s=2, he_grenade=3, m4a1_s=4]")
-        self.assertEqual(sample.damage_sum, [0.0, 34.0, 52.0, 100.0], "damage_sum 不匹配")
-        self.assertEqual(sample.damage_mean, [0.0, 34.0, 52.0, 100.0], "damage_mean 不匹配")
-        self.assertEqual(sample.damage_max, [0.0, 34.0, 52.0, 100.0], "damage_max 不匹配")
-        self.assertEqual(sample.is_lethal, [0, 0, 0, 1], "is_lethal 应仅在 damage=100 时为 1")
+        # Verify weapon_top1_idx and damage aggregation
+        self.assertEqual(sample.weapon_top1_idx, [2, 2, 3, 4], "weapon_top1_idx should be [usp_s=2, usp_s=2, he_grenade=3, m4a1_s=4]")
+        self.assertEqual(sample.damage_sum, [0.0, 34.0, 52.0, 100.0], "damage_sum mismatch")
+        self.assertEqual(sample.damage_mean, [0.0, 34.0, 52.0, 100.0], "damage_mean mismatch")
+        self.assertEqual(sample.damage_max, [0.0, 34.0, 52.0, 100.0], "damage_max mismatch")
+        self.assertEqual(sample.is_lethal, [0, 0, 0, 1], "is_lethal should be 1 only when damage=100")
 
-        # 验证 meta
-        self.assertEqual(sample.meta["match_id"], "M0001", "meta.match_id 不匹配")
-        self.assertEqual(sample.meta["player_id"], "76561198000000000", "meta.player_id 不匹配")
-        self.assertEqual(sample.meta["round_number"], 1, "meta.round_number 不匹配")
-        self.assertAlmostEqual(sample.meta["window_start_s"], 0.4, places=5, msg="meta.window_start_s 不匹配")
+        # Verify meta
+        self.assertEqual(sample.meta["match_id"], "M0001", "meta.match_id mismatch")
+        self.assertEqual(sample.meta["player_id"], "76561198000000000", "meta.player_id mismatch")
+        self.assertEqual(sample.meta["round_number"], 1, "meta.round_number mismatch")
+        self.assertAlmostEqual(sample.meta["window_start_s"], 0.4, places=5, msg="meta.window_start_s mismatch")
 
     def test_invalid_timestamp(self):
-        """测试非法 timestamp（负值或缺失）被过滤"""
+        """Invalid timestamps (negative or missing) are filtered."""
         invalid_json = '''
         {
             "match_id": "M0002",
@@ -184,14 +182,14 @@ class TestMockAdapterRules(unittest.TestCase):
         data = json.loads(invalid_json)
         samples = self.adapter.parse_obj(data)
         
-        self.assertEqual(len(samples), 1, "应生成一个样本（仅一个有效事件）")
+        self.assertEqual(len(samples), 1, "Should produce one sample (only one valid event)")
         sample = samples[0]
-        self.assertEqual(sample.timestamp_rel, [0.0, 0.0, 0.0, 0.0], "非法 timestamp 应被过滤，填充 0")
-        self.assertEqual(sample.mask, [1, 0, 0, 0], "mask 应仅有一个有效事件")
-        self.assertEqual(sample.loc_idx, [3, 0, 0, 0], "location 应为 mid=3，填充 PAD")
+        self.assertEqual(sample.timestamp_rel, [0.0, 0.0, 0.0, 0.0], "Invalid timestamps should be filtered; zeros padded")
+        self.assertEqual(sample.mask, [1, 0, 0, 0], "mask should indicate a single valid event")
+        self.assertEqual(sample.loc_idx, [3, 0, 0, 0], "location should be mid=3, rest padded")
 
     def test_unknown_location(self):
-        """测试未知 location 被映射为 UNK"""
+        """Unknown location should map to UNK."""
         json_with_unknown = '''
         {
             "match_id": "M0003",
@@ -219,12 +217,12 @@ class TestMockAdapterRules(unittest.TestCase):
         data = json.loads(json_with_unknown)
         samples = self.adapter.parse_obj(data)
         
-        self.assertEqual(len(samples), 1, "应生成一个样本")
+        self.assertEqual(len(samples), 1, "Should produce one sample")
         sample = samples[0]
-        self.assertEqual(sample.loc_idx, [1, 0, 0, 0], "未知 location 应映射为 UNK=1")
+        self.assertEqual(sample.loc_idx, [1, 0, 0, 0], "Unknown location should map to UNK=1")
 
     def test_outcome_impact_dedupe_and_cap(self):
-        """测试 outcome/impact 去重和 K=3 限制"""
+        """Outcome/impact should be de-duplicated and capped at K=3."""
         json_with_duplicates = '''
         {
             "match_id": "M0004",
@@ -257,25 +255,25 @@ class TestMockAdapterRules(unittest.TestCase):
         data = json.loads(json_with_duplicates)
         samples = self.adapter.parse_obj(data)
         
-        self.assertEqual(len(samples), 1, "应生成一个样本")
+        self.assertEqual(len(samples), 1, "Should produce one sample")
         sample = samples[0]
         expected_outcome = [
-            [0, 0, 0, 1, 1, 1],  # EnemyDamaged=3, Kill=4, Death=5（去重后前 3 个）
+            [0, 0, 0, 1, 1, 1],  # EnemyDamaged=3, Kill=4, Death=5 (deduplicated, first 3)
             [0, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 0]
         ]
         expected_impact = [
-            [0, 0, 0, 1, 1, 1],  # Pressure=3, Initiation=5, ZoneControl=4（去重后前 3 个）
+            [0, 0, 0, 1, 1, 1],  # Pressure=3, Initiation=5, ZoneControl=4 (deduplicated, first 3)
             [0, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 0]
         ]
-        self.assertEqual(sample.outcome_multi, expected_outcome, "outcome 应去重并限制 K=3")
-        self.assertEqual(sample.impact_multi, expected_impact, "impact 应去重并限制 K=3")
+        self.assertEqual(sample.outcome_multi, expected_outcome, "outcome should be deduplicated and capped at K=3")
+        self.assertEqual(sample.impact_multi, expected_impact, "impact should be deduplicated and capped at K=3")
 
     def test_window_split(self):
-        """测试超过 T=4 的事件被切分为多个窗口"""
+        """Events exceeding T=4 should be split into multiple windows."""
         json_long_traj = '''
         {
             "match_id": "M0005",
@@ -302,12 +300,12 @@ class TestMockAdapterRules(unittest.TestCase):
         data = json.loads(json_long_traj)
         samples = self.adapter.parse_obj(data)
         
-        self.assertEqual(len(samples), 2, "应生成两个窗口（5 事件切分为 [4, 1]）")
-        self.assertEqual(samples[0].loc_idx, [2, 2, 3, 4], "第一个窗口 location 应为 [mid_window=2, mid_window=2, mid=3, connector=4]")
-        self.assertEqual(samples[1].loc_idx, [5, 0, 0, 0], "第二个窗口 location 应为 [a_site=5, PAD, PAD, PAD]")
+        self.assertEqual(len(samples), 2, "Should produce two windows (5 events -> [4, 1])")
+        self.assertEqual(samples[0].loc_idx, [2, 2, 3, 4], "First window locations should be [mid_window=2, mid_window=2, mid=3, connector=4]")
+        self.assertEqual(samples[1].loc_idx, [5, 0, 0, 0], "Second window locations should be [a_site=5, PAD, PAD, PAD]")
 
     def test_missing_fields(self):
-        """测试缺失字段的处理：player_id, team 等"""
+        """Missing fields handling: player_id, team, etc."""
         json_missing = '''
         {
             "match_id": "M0006",
@@ -333,10 +331,10 @@ class TestMockAdapterRules(unittest.TestCase):
         data = json.loads(json_missing)
         samples = self.adapter.parse_obj(data)
         
-        self.assertEqual(len(samples), 1, "应生成一个样本")
+        self.assertEqual(len(samples), 1, "Should produce one sample")
         sample = samples[0]
-        self.assertEqual(sample.meta["player_id"], "unknown", "缺失 player_id 应使用默认值 'unknown'")
-        self.assertEqual(sample.team_idx, 0, "缺失 team 应默认 CT，team_idx=0")
+        self.assertEqual(sample.meta["player_id"], "unknown", "Missing player_id should default to 'unknown'")
+        self.assertEqual(sample.team_idx, 0, "Missing team should default to CT (team_idx=0)")
 
 if __name__ == '__main__':
     unittest.main()

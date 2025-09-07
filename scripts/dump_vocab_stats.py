@@ -142,7 +142,6 @@ def main():
             any_error = True
             print(f"{RED}error:{RESET} failed to parse {args.tag_vocab}: {e}")
 
-    # ---- Summary ----
     print_header("Summary")
     if any_error:
         msg = "Errors found (see above)."

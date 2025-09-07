@@ -3,7 +3,6 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
-# project modules
 from utils.config import load_cfg, load_yaml_ns, load_vocab_dir
 from utils.seed import set_global_seed
 from adapters.mock_adapter import MockAdapter
@@ -11,6 +10,12 @@ from datasets.player_dataset import PlayerDataset
 from dataloading.collate import collate_fn
 from models.encoder import Encoder
 
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message="The PyTorch API of nested tensors is in prototype stage",
+    category=UserWarning
+)
 
 def has_nan_or_inf(t: torch.Tensor) -> bool:
     return torch.isnan(t).any().item() or torch.isinf(t).any().item()

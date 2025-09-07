@@ -29,10 +29,12 @@ def _clip(x: float, lo: float, hi: float) -> float:
 
 class MockAdapter(BaseAdapter):
     """
-    Minimal JSON→Sample adapter for the mock demo.
-    Expects:
-      - self.vocab.action/location/outcome/impact/weapon.tokens
-      - self.norm may be None or contain timestamp/damage_* ranges
+    Adapter that converts mock JSON into `Sample` objects.
+
+    - Expects vocab tokens for action/location/outcome/impact/weapon.
+    - Supports optional normalization for timestamp and damage.
+    - Splits trajectories into fixed-length windows (T) with padding and mask.
+    - Outputs indices, multi-label vectors, weapon/damage stats, and metadata.
     """
 
     def __init__(self, vocab_cfg, norm_cfg, T: int, k_multi: int = 3) -> None:
@@ -84,13 +86,13 @@ class MockAdapter(BaseAdapter):
                 team = str(p.get("team", "CT")).upper()
                 team_idx = 0 if team == "CT" else 1
 
-                # 过滤有效事件：timestamp 必须存在且非负
-                traj = [e for e in p.get("trajectory", []) if "timestamp" in e and isinstance(e["timestamp"], (int, float)) and e["timestamp"] >= 0.0]  # 改动：添加 timestamp 验证
+                # Filter valid events: require a numeric 'timestamp' >= 0.
+                traj = [e for e in p.get("trajectory", []) if "timestamp" in e and isinstance(e["timestamp"], (int, float)) and e["timestamp"] >= 0.0]
 
-                # 按 timestamp 排序
+                # Sort by timestamp (ascending)
                 traj.sort(key=lambda e: e["timestamp"])
 
-                # 按 T 大小切分非重叠窗口
+                # Split into non-overlapping windows of length T
                 for win_start in range(0, len(traj), T):
                     evs = traj[win_start:win_start + T]
                     if not evs:
@@ -98,24 +100,24 @@ class MockAdapter(BaseAdapter):
 
                     L = len(evs)
                     pad = T - L
-                    mask = [1] * L + [0] * pad  # 用于后续 BoolTensor
+                    mask = [1] * L + [0] * pad  # Boolean mask (1=valid, 0=padding)
 
                     ts_vals = [e["timestamp"] for e in evs]
                     min_ts = min(ts_vals) if ts_vals else 0.0
                     ts_rel = [t - min_ts for t in ts_vals]
 
-                    # 归一化
+                    # Timestamp normalization
                     if ts_mode == "minmax":
                         ts_norm = [_norm_minmax(t, ts_min, ts_max) for t in ts_rel]
                     else:
                         ts_norm = ts_rel
                     ts_norm += [0.0] * pad
 
-                    # 离散字段索引
+                    # Discrete feature indices
                     action_idx = [_tok2id(act_vocab, str(e.get("action", ""))) for e in evs] + [0] * pad
                     loc_idx = [_tok2id(loc_vocab, str(e.get("location", ""))) for e in evs] + [0] * pad
 
-                    # 多标签处理：去重、限制 K 个
+                    # Multi-label fields: deduplicate tokens and cap at K
                     outcome_multi: List[List[int]] = []
                     impact_multi: List[List[int]] = []
 
@@ -142,7 +144,7 @@ class MockAdapter(BaseAdapter):
                     outcome_multi += [[0] * O] * pad
                     impact_multi += [[0] * I] * pad
 
-                    # 武器与伤害聚合（每事件）
+                    # Weapon and damage aggregation (per event)
                     weapon_top1_idx = []
                     dmg_sums = []
                     dmg_means = []
@@ -166,12 +168,12 @@ class MockAdapter(BaseAdapter):
                             except (ValueError, TypeError):
                                 pass
 
-                        # 伤害聚合
+                        # Damage aggregation
                         d_sum = sum(damage_vals)
                         d_max = max(damage_vals) if damage_vals else 0.0
                         d_mean = d_sum / len(damage_vals) if damage_vals else 0.0
                         is_l = 1 if d_max >= 100.0 else 0
-                        # 最大伤害 >= 100 判断 is_lethal
+                        # Mark lethal if max damage >= 100
 
                         if dmg_mode == "clip_minmax":
                             d_sum = _clip(d_sum, dmg_min, dmg_max)
@@ -183,7 +185,7 @@ class MockAdapter(BaseAdapter):
                         dmg_maxs.append(d_max)
                         is_lethals.append(is_l)
 
-                        # 武器 top1：如果有伤害配对则按伤害加权，否则按频次
+                        # Weapon top-1: weight by damage when aligned; otherwise by frequency
                         if weapons:
                             if len(weapons) == len(damage_vals):
                                 w_dmg = defaultdict(float)
@@ -195,7 +197,7 @@ class MockAdapter(BaseAdapter):
                                 top_w = cnt.most_common(1)[0][0] if cnt else ""
                             w_idx = _tok2id(wpn_vocab, top_w)
                         else:
-                            w_idx = 1  # 无武器时使用 UNK
+                            w_idx = 1  # Use UNK when no weapon present
                         weapon_top1_idx.append(w_idx)
 
                     weapon_top1_idx += [0] * pad
